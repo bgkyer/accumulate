@@ -30,14 +30,14 @@ type transactionStateInfo struct {
 type transactionLists struct {
 	validatedTx []*transactionStateInfo //list of validated transaction chain state objects for block
 	pendingTx   []*transactionStateInfo //list of pending transaction chain state objects for block
-	synthTxMap  map[types.Bytes32]*[]transactionStateInfo
+	synthTxMap  map[types.Bytes32][]transactionStateInfo
 }
 
 // reset will (re)initialize the transaction lists, this should be done on startup and at the end of each block
 func (t *transactionLists) reset() {
 	t.pendingTx = nil
 	t.validatedTx = nil
-	t.synthTxMap = make(map[types.Bytes32]*[]transactionStateInfo)
+	t.synthTxMap = make(map[types.Bytes32][]transactionStateInfo)
 }
 
 type bucket string
@@ -139,21 +139,25 @@ func (s *StateDB) Sync() {
 	s.sync.Wait()
 }
 
-//GetTxRange get the transaction id's in a given range
-func (s *StateDB) GetTxRange(chainId *types.Bytes32, start int64, end int64) (hashes []types.Bytes32, maxAvailable int64, err error) {
+//GetChainRange get the transaction id's in a given range
+func (s *StateDB) GetChainRange(chainId []byte, start int64, end int64) (hashes []types.Bytes32, maxAvailable int64, err error) {
 	s.mutex.Lock()
-	h, err := s.mm.GetRange(chainId[:], start, end)
-	s.mm.SetChainID(chainId[:])
-	maxAvailable = s.mm.GetElementCount()
-	s.mutex.Unlock()
-	if err != nil {
-		return nil, 0, err
-	}
-	for i := range h {
-		hashes = append(hashes, h[i].Bytes32())
+	defer s.mutex.Unlock()
+
+	hashes = make([]types.Bytes32, 0, end-start)
+	for start < end {
+		h, err := s.mm.GetRange(chainId, start, end)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		for i := range h {
+			hashes = append(hashes, h[i].Bytes32())
+		}
+		start += int64(len(h))
 	}
 
-	return hashes, maxAvailable, nil
+	return hashes, s.mm.GetElementCount(), nil
 }
 
 //GetTx get the transaction by transaction ID
@@ -197,15 +201,10 @@ func (s *StateDB) GetSyntheticTxIds(txId []byte) (syntheticTxIds []byte, err err
 //AddSynthTx add the synthetic transaction which is mapped to the parent transaction
 func (tx *DBTransaction) AddSynthTx(parentTxId types.Bytes, synthTxId types.Bytes, synthTxObject *Object) {
 	tx.state.logInfo("AddSynthTx", "txid", logging.AsHex(synthTxId), "entry", logging.AsHex(synthTxObject.Entry))
-	var val *[]transactionStateInfo
-	var ok bool
 
 	parentHash := parentTxId.AsBytes32()
-	if val, ok = tx.transactions.synthTxMap[parentHash]; !ok {
-		val = new([]transactionStateInfo)
-		tx.transactions.synthTxMap[parentHash] = val
-	}
-	*val = append(*val, transactionStateInfo{synthTxObject, nil, synthTxId})
+	m := tx.transactions.synthTxMap
+	m[parentHash] = append(m[parentHash], transactionStateInfo{synthTxObject, nil, synthTxId})
 }
 
 // AddTransaction queues (pending) transaction signatures and (optionally) an
@@ -363,7 +362,7 @@ func (tx *DBTransaction) writeTxs(mutex *sync.Mutex, group *sync.WaitGroup) erro
 		txHash := txn.TxId.AsBytes32()
 		if synthTxInfos, ok := tx.transactions.synthTxMap[txHash]; ok {
 			var synthData []byte
-			for _, synthTxInfo := range *synthTxInfos {
+			for _, synthTxInfo := range synthTxInfos {
 				synthData = append(synthData, synthTxInfo.TxId...)
 				synthTxData, err := synthTxInfo.Object.MarshalBinary()
 				if err != nil {
@@ -404,10 +403,6 @@ func (tx *DBTransaction) writeTxs(mutex *sync.Mutex, group *sync.WaitGroup) erro
 		mutex.Unlock()
 	}
 
-	//clear out the transactions after they have been processed
-	tx.transactions.validatedTx = nil
-	tx.transactions.pendingTx = nil
-	tx.transactions.synthTxMap = make(map[types.Bytes32]*[]transactionStateInfo)
 	return nil
 }
 
@@ -475,9 +470,35 @@ func (tx *DBTransaction) writeChainState(group *sync.WaitGroup, mutex *sync.Mute
 	return nil
 }
 
-func (tx *DBTransaction) writeAnchors(mutex *sync.Mutex, blockIndex int64, timestamp time.Time, chainsThatUpdated []types.Bytes32) error {
+func (tx *DBTransaction) writeAnchors(blockIndex int64, timestamp time.Time) error {
+	// Collect and sort a list of all chain IDs
+	chains := make([][32]byte, 0, len(tx.updates))
+	for id := range tx.updates {
+		chains = append(chains, id)
+	}
+	sort.Slice(chains, func(i, j int) bool {
+		return bytes.Compare(chains[i][:], chains[j][:]) < 0
+	})
+
+	// Collect and sort a list of all synthetic transaction IDs
+	var txids [][32]byte
+	seen := map[[32]byte]bool{}
+	for _, txns := range tx.transactions.synthTxMap {
+		for _, txn := range txns {
+			txid := txn.TxId.AsBytes32()
+			if seen[txid] {
+				continue
+			}
+			seen[txid] = true
+			txids = append(txids, txid)
+		}
+	}
+	sort.Slice(txids, func(i, j int) bool {
+		return bytes.Compare(txids[i][:], txids[j][:]) < 0
+	})
+
 	// Load the previous anchor chain head
-	prevHead, err := tx.state.getAnchorHead()
+	prevHead, prevCount, err := tx.state.GetAnchorHead()
 	if errors.Is(err, storage.ErrNotFound) {
 		prevHead = &AnchorMetadata{Index: -1}
 	} else if err != nil {
@@ -489,17 +510,8 @@ func (tx *DBTransaction) writeAnchors(mutex *sync.Mutex, blockIndex int64, times
 		panic(fmt.Errorf("Current height is %d but the next block height is %d!", prevHead.Index, blockIndex))
 	}
 
-	// Metadata
-	head := new(AnchorMetadata)
-	head.Index = blockIndex
-	head.PreviousHeight = tx.state.mm.MS.Count
-	head.Timestamp = timestamp
-	head.Chains = make([][32]byte, len(chainsThatUpdated))
-
 	// Add an anchor for each updated chain to the anchor chain
-	for i, chainId := range chainsThatUpdated {
-		head.Chains[i] = chainId
-
+	for _, chainId := range chains {
 		err := tx.state.mm.SetChainID(chainId[:])
 		if err != nil {
 			return err
@@ -513,12 +525,21 @@ func (tx *DBTransaction) writeAnchors(mutex *sync.Mutex, blockIndex int64, times
 		tx.state.mm.AddHash(root)
 	}
 
+	// Add all of the synth txids
+	for _, txid := range txids {
+		tx.state.mm.AddHash(txid[:])
+	}
+
+	// Add the anchor head to the anchor chain
+	head := new(AnchorMetadata)
+	head.Index = blockIndex
+	head.PreviousHeight = prevCount
+	head.Timestamp = timestamp
+	head.Chains = chains
 	data, err := head.MarshalBinary()
 	if err != nil {
 		return err
 	}
-
-	// Add the anchor head to the anchor chain
 	tx.state.mm.AddHash(data)
 
 	// Index the anchor chain against the block index
@@ -527,7 +548,7 @@ func (tx *DBTransaction) writeAnchors(mutex *sync.Mutex, blockIndex int64, times
 	// Update the Patricia tree
 	var id [32]byte
 	copy(id[:], []byte(bucketMinorAnchorChain.String()))
-	tx.state.bpt.Bpt.Insert(id, sha256.Sum256(data))
+	tx.state.bpt.Bpt.Insert(id, tx.state.mm.MS.GetMDRoot().Bytes32())
 	return nil
 }
 
@@ -537,28 +558,28 @@ func (tx *DBTransaction) writeBatches() {
 	tx.state.bpt.DBManager.EndBatch()
 }
 
-func (s *StateDB) getAnchorHead() (*AnchorMetadata, error) {
+func (s *StateDB) GetAnchorHead() (*AnchorMetadata, int64, error) {
 	err := s.mm.SetChainID([]byte(bucketMinorAnchorChain))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	if s.mm.MS.Count == 0 {
-		return nil, storage.ErrNotFound
+		return nil, 0, storage.ErrNotFound
 	}
 
 	data, err := s.mm.Get(s.mm.MS.Count - 1)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read anchor chain element %d", s.mm.MS.Count-1)
+		return nil, 0, fmt.Errorf("failed to read anchor chain element %d", s.mm.MS.Count-1)
 	}
 
 	head := new(AnchorMetadata)
 	err = head.UnmarshalBinary(data)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
-	return head, nil
+	return head, s.mm.MS.Count, nil
 }
 
 func (s *StateDB) SubnetID() (string, error) {
@@ -570,7 +591,7 @@ func (s *StateDB) SubnetID() (string, error) {
 }
 
 func (s *StateDB) BlockIndex() (int64, error) {
-	head, err := s.getAnchorHead()
+	head, _, err := s.GetAnchorHead()
 	if err != nil {
 		return 0, err
 	}
@@ -640,13 +661,8 @@ func (tx *DBTransaction) Commit(blockHeight int64, timestamp time.Time) ([]byte,
 	for _, k := range writeOrder {
 		tx.state.GetDB().Key(k).PutBatch(tx.writes[k])
 	}
-	// The compiler optimizes this into a constant-time operation
-	for k := range tx.writes {
-		delete(tx.writes, k)
-	}
 
-	// Don't write the anchor during the genesis TX
-	err = tx.writeAnchors(mutex, blockHeight, timestamp, updateOrder)
+	err = tx.writeAnchors(blockHeight, timestamp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make anchor: %v", err)
 	}
@@ -661,6 +677,16 @@ func (tx *DBTransaction) Commit(blockHeight int64, timestamp time.Time) ([]byte,
 	tx.writeBatches()
 
 	tx.updates = make(map[types.Bytes32]*blockUpdates)
+
+	// The compiler optimizes this into a constant-time operation
+	for k := range tx.writes {
+		delete(tx.writes, k)
+	}
+
+	//clear out the transactions after they have been processed
+	tx.transactions.validatedTx = nil
+	tx.transactions.pendingTx = nil
+	tx.transactions.synthTxMap = make(map[types.Bytes32][]transactionStateInfo)
 
 	//return the state of the BPT for the state of the block
 	rh := types.Bytes(tx.state.RootHash()).AsBytes32()
