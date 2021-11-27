@@ -50,6 +50,7 @@ const (
 	bucketStagedSynthTx    = bucket("StagedSynthTx") //store the staged synthetic transactions
 	bucketTxToSynthTx      = bucket("TxToSynthTx")   //TXID to synthetic TXID
 	bucketMinorAnchorChain = bucket("MinorAnchorChain")
+	bucketSynthTxnSigs     = bucket("SyntheticTransactionSignatures")
 
 	markPower = int64(8)
 )
@@ -201,6 +202,7 @@ func (s *StateDB) GetSyntheticTxIds(txId []byte) (syntheticTxIds []byte, err err
 //AddSynthTx add the synthetic transaction which is mapped to the parent transaction
 func (tx *DBTransaction) AddSynthTx(parentTxId types.Bytes, synthTxId types.Bytes, synthTxObject *Object) {
 	tx.state.logInfo("AddSynthTx", "txid", logging.AsHex(synthTxId), "entry", logging.AsHex(synthTxObject.Entry))
+	tx.dirty = true
 
 	parentHash := parentTxId.AsBytes32()
 	m := tx.transactions.synthTxMap
@@ -215,6 +217,7 @@ func (tx *DBTransaction) AddTransaction(chainId *types.Bytes32, txId types.Bytes
 		txAcceptedEntry = txAccepted.Entry
 	}
 	tx.state.logInfo("AddTransaction", "chainId", logging.AsHex(chainId), "txid", logging.AsHex(txId), "pending", logging.AsHex(txPending.Entry), "accepted", logging.AsHex(txAcceptedEntry))
+	tx.dirty = true
 
 	chainType, _ := binary.Uvarint(txPending.Entry)
 	if types.ChainType(chainType) != types.ChainTypePendingTransaction {
@@ -272,15 +275,42 @@ func (s *StateDB) GetPersistentEntry(chainId []byte, verify bool) (*Object, erro
 	return ret, nil
 }
 
-// GetTransaction loads the state of the given transaction.
-func (s *StateDB) GetTransaction(txid []byte) (*Object, error) {
+func (s *StateDB) getObject(keys ...interface{}) (*Object, error) {
 	s.Sync()
 
 	if s.db == nil {
 		return nil, fmt.Errorf("database has not been initialized")
 	}
 
-	data, err := s.db.Key(bucketTx, txid).Get()
+	data, err := s.db.Key(keys...).Get()
+	if err != nil {
+		return nil, err
+	}
+
+	ret := &Object{}
+	err = ret.UnmarshalBinary(data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal: %v", err)
+	}
+
+	return ret, nil
+}
+
+// GetTransaction loads the state of the given transaction.
+func (s *StateDB) GetTransaction(txid []byte) (*Object, error) {
+	obj, err := s.getObject(bucketTx, txid)
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, fmt.Errorf("%w: no transaction defined for %X", storage.ErrNotFound, txid)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction %X: %v", txid, err)
+	}
+	return obj, nil
+}
+
+// GetSynthTxn loads the state of the given staged synthetic transaction.
+func (s *StateDB) GetSynthTxn(txid [32]byte) (*Object, error) {
+	obj, err := s.getObject(bucketStagedSynthTx, "", txid)
 	if errors.Is(err, storage.ErrNotFound) {
 		return nil, fmt.Errorf("%w: no transaction defined for %X", storage.ErrNotFound, txid)
 	}
@@ -288,13 +318,8 @@ func (s *StateDB) GetTransaction(txid []byte) (*Object, error) {
 		return nil, fmt.Errorf("failed to get transaction %X: %v", txid, err)
 	}
 
-	ret := &Object{}
-	err = ret.UnmarshalBinary(data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal state for %x", txid)
-	}
-
-	return ret, nil
+	s.logInfo("GetSynthTxn", "txid", logging.AsHex(txid), "entry", logging.AsHex(obj.Entry))
+	return obj, nil
 }
 
 // GetCurrentEntry retrieves the current state object from the database based upon chainId.  Current state either comes
@@ -335,6 +360,7 @@ func (tx *DBTransaction) GetCurrentEntry(chainId []byte) (*Object, error) {
 // of a transaction.  The entry is the state object associated with
 func (tx *DBTransaction) AddStateEntry(chainId *types.Bytes32, txHash *types.Bytes32, object *Object) {
 	tx.state.logInfo("AddStateEntry", "chainId", logging.AsHex(chainId), "txHash", logging.AsHex(txHash), "entry", logging.AsHex(object.Entry))
+	tx.dirty = true
 	begin := time.Now()
 
 	tx.state.TimeBucket = tx.state.TimeBucket + float64(time.Since(begin))*float64(time.Nanosecond)*1e-9
@@ -470,6 +496,69 @@ func (tx *DBTransaction) writeChainState(group *sync.WaitGroup, mutex *sync.Mute
 	return nil
 }
 
+func (s *StateDB) GetSynthTxnSigs() ([]SyntheticSignature, error) {
+	b, err := s.GetDB().Key(bucketSynthTxnSigs).Get()
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	sigs := new(SyntheticSignatures)
+	err = sigs.UnmarshalBinary(b)
+	if err != nil {
+		return nil, err
+	}
+
+	return sigs.Signatures, nil
+}
+
+func (tx *DBTransaction) writeSynthTxnSigs() error {
+	sigMap := map[[32]byte]*SyntheticSignature{}
+
+	sigs, err := tx.state.GetSynthTxnSigs()
+	if err != nil {
+		return err
+	}
+	for _, sig := range sigs {
+		sigMap[sig.Txid] = &sig
+	}
+
+	for _, txid := range tx.delSynthSigs {
+		delete(sigMap, txid)
+	}
+
+	for _, sig := range tx.addSynthSigs {
+		sigMap[sig.Txid] = sig
+	}
+
+	txids := make([][32]byte, 0, len(sigMap))
+	for txid := range sigMap {
+		txids = append(txids, txid)
+	}
+	sort.Slice(txids, func(i, j int) bool {
+		return bytes.Compare(txids[i][:], txids[j][:]) < 0
+	})
+
+	sigs = make([]SyntheticSignature, len(txids))
+	for i, txid := range txids {
+		sigs[i] = *sigMap[txid]
+	}
+
+	b, err := (&SyntheticSignatures{Signatures: sigs}).MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	tx.GetDB().Key(bucketSynthTxnSigs).PutBatch(b)
+	hash := sha256.Sum256(b)
+
+	var id [32]byte
+	copy(id[:], []byte(bucketSynthTxnSigs))
+	tx.state.bpt.Bpt.Insert(id, hash)
+	return nil
+}
+
 func (tx *DBTransaction) writeAnchors(blockIndex int64, timestamp time.Time) error {
 	// Collect and sort a list of all chain IDs
 	chains := make([][32]byte, 0, len(tx.updates))
@@ -547,7 +636,7 @@ func (tx *DBTransaction) writeAnchors(blockIndex int64, timestamp time.Time) err
 
 	// Update the Patricia tree
 	var id [32]byte
-	copy(id[:], []byte(bucketMinorAnchorChain.String()))
+	copy(id[:], []byte(bucketMinorAnchorChain))
 	tx.state.bpt.Bpt.Insert(id, tx.state.mm.MS.GetMDRoot().Bytes32())
 	return nil
 }
@@ -582,6 +671,11 @@ func (s *StateDB) GetAnchorHead() (*AnchorMetadata, int64, error) {
 	return head, s.mm.MS.Count, nil
 }
 
+func (s *StateDB) GetAnchors(start, end int64) ([]types.Bytes32, error) {
+	h, _, err := s.GetChainRange([]byte(bucketMinorAnchorChain), start, end)
+	return h, err
+}
+
 func (s *StateDB) SubnetID() (string, error) {
 	b, err := s.GetDB().Key("SubnetID").Get()
 	if err != nil {
@@ -602,8 +696,7 @@ func (s *StateDB) BlockIndex() (int64, error) {
 // Commit will push the data to the database and update the patricia trie
 func (tx *DBTransaction) Commit(blockHeight int64, timestamp time.Time) ([]byte, error) {
 	//build a list of keys from the map
-	currentStateCount := len(tx.updates)
-	if currentStateCount == 0 {
+	if len(tx.transactions.validatedTx) == 0 && len(tx.transactions.pendingTx) == 0 {
 		//only attempt to record the block if we have any data.
 		return tx.RootHash(), nil
 	}
@@ -660,6 +753,11 @@ func (tx *DBTransaction) Commit(blockHeight int64, timestamp time.Time) ([]byte,
 	})
 	for _, k := range writeOrder {
 		tx.state.GetDB().Key(k).PutBatch(tx.writes[k])
+	}
+
+	err = tx.writeSynthTxnSigs()
+	if err != nil {
+		return nil, fmt.Errorf("failed to save synth txn signatures: %v", err)
 	}
 
 	err = tx.writeAnchors(blockHeight, timestamp)

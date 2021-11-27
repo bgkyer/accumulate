@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 	tmcfg "github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/privval"
+	"github.com/tendermint/tendermint/rpc/client/local"
 )
 
 var LocalBVN = &networks.Subnet{
@@ -99,7 +100,8 @@ func NewBVCNode(dir string, memDB bool, relayTo []string, newZL func(string) zer
 		return nil, nil, nil, fmt.Errorf("failed to create RPC relay: %v", err)
 	}
 
-	mgr, err := chain.NewBlockValidatorExecutor(api.NewQuery(relay), sdb, pv.Key.PrivKey.Bytes())
+	clientProxy := node.NewLocalClient()
+	mgr, err := chain.NewBlockValidatorExecutor(api.NewQuery(relay), clientProxy, sdb, pv.Key.PrivKey.Bytes())
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create chain manager: %v", err)
 	}
@@ -140,6 +142,16 @@ func NewBVCNode(dir string, memDB bool, relayTo []string, newZL func(string) zer
 		_ = node.Stop()
 		node.Wait()
 	})
+
+	lnode, ok := node.Service.(local.NodeService)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("node is not a local node service!")
+	}
+	lclient, err := local.New(lnode)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create local node client: %v", err)
+	}
+	clientProxy.Set(lclient)
 
 	return node, sdb, pv, nil
 }

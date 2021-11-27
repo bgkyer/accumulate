@@ -115,7 +115,7 @@ func (s *AccumulatorTestSuite) TestDeliverTx() {
 		data, err := tx.Marshal()
 		s.Require().NoError(err)
 
-		s.Chain().EXPECT().DeliverTx(gomock.Any()).Return(new(protocol.TxResult), nil)
+		s.Chain().EXPECT().DeliverTx(gomock.Any()).Return(nil)
 
 		resp := s.App(nil).DeliverTx(tmabci.RequestDeliverTx{Tx: data})
 		s.Require().Zero(resp.Code)

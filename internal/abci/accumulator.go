@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/AccumulateNetwork/accumulate"
@@ -70,21 +71,27 @@ func NewAccumulator(db State, address crypto.Address, chain Chain, logger log.Lo
 
 var _ abci.Application = (*Accumulator)(nil)
 
+func (app *Accumulator) fatal(err interface{}) {
+	app.didPanic = true
+
+	app.logger.Error("Fatal error", "error", err, "stack", debug.Stack())
+	if err, ok := err.(error); ok {
+		sentry.CaptureException(fmt.Errorf("Fatal error: %w", err))
+	} else {
+		sentry.CaptureException(fmt.Errorf("Fatal error: %v", err))
+	}
+}
+
 func (app *Accumulator) recover(code *uint32) {
 	r := recover()
 	if r == nil {
 		return
 	}
 
-	app.didPanic = true
+	app.fatal(r)
+
 	if code != nil {
 		*code = protocol.CodeUnknownError
-	}
-
-	if err, ok := r.(error); ok {
-		sentry.CaptureException(fmt.Errorf("did panic: %w", err))
-	} else {
-		sentry.CaptureException(fmt.Errorf("did panic: %v", r))
 	}
 }
 
@@ -224,7 +231,7 @@ func (app *Accumulator) InitChain(req abci.RequestInitChain) abci.ResponseInitCh
 		panic(fmt.Errorf("failed to marshal genesis TX: %v", err))
 	}
 
-	app.chain.BeginBlock(BeginBlockRequest{
+	_, _ = app.chain.BeginBlock(BeginBlockRequest{
 		IsLeader: false,
 		Height:   0,
 	})
@@ -234,7 +241,7 @@ func (app *Accumulator) InitChain(req abci.RequestInitChain) abci.ResponseInitCh
 		panic(fmt.Errorf("failed to validate genesis TX: %v", customErr))
 	}
 
-	_, customErr = app.chain.DeliverTx(tx)
+	customErr = app.chain.DeliverTx(tx)
 	if customErr != nil {
 		panic(fmt.Errorf("failed to execute genesis TX: %v", customErr))
 	}
@@ -253,12 +260,30 @@ func (app *Accumulator) InitChain(req abci.RequestInitChain) abci.ResponseInitCh
 func (app *Accumulator) BeginBlock(req abci.RequestBeginBlock) abci.ResponseBeginBlock {
 	defer app.recover(nil)
 
+	var ret abci.ResponseBeginBlock
+
 	//Identify the leader for this block, if we are the proposer... then we are the leader.
-	app.chain.BeginBlock(BeginBlockRequest{
+	r, err := app.chain.BeginBlock(BeginBlockRequest{
 		IsLeader: bytes.Equal(app.address.Bytes(), req.Header.GetProposerAddress()),
 		Height:   req.Header.Height,
 		Time:     req.Header.Time,
 	})
+	if err != nil {
+		app.fatal(err)
+		return ret
+	}
+
+	for _, syn := range r.SynthTxns {
+		ret.Events = append(ret.Events, abci.Event{
+			Type: "accSyn",
+			Attributes: []abci.EventAttribute{
+				{Key: "type", Value: types.TxType(syn.Type).String()},
+				{Key: "hash", Value: fmt.Sprintf("%X", syn.Hash)},
+				{Key: "url", Value: syn.Url},
+				{Key: "txRef", Value: fmt.Sprintf("%X", syn.TxRef)},
+			},
+		})
+	}
 
 	app.timer = time.Now()
 
@@ -287,7 +312,7 @@ func (app *Accumulator) BeginBlock(req abci.RequestBeginBlock) abci.ResponseBegi
 
 	*/
 
-	return abci.ResponseBeginBlock{}
+	return ret
 }
 
 // CheckTx implements github.com/tendermint/tendermint/abci/types.Application.
@@ -332,7 +357,7 @@ func (app *Accumulator) CheckTx(req abci.RequestCheckTx) (rct abci.ResponseCheck
 		if e2 == nil {
 			u2 = u.String()
 		}
-		sentry.CaptureException(err)
+		sentry.CaptureException(customErr)
 		app.logger.Info("Check failed", "type", sub.TransactionType().Name(), "tx", txHash, "error", customErr)
 		ret.Code = uint32(customErr.Code)
 		ret.GasWanted = 0
@@ -376,7 +401,7 @@ func (app *Accumulator) DeliverTx(req abci.RequestDeliverTx) (rdt abci.ResponseD
 	}
 
 	//run through the validation node
-	r, customErr := app.chain.DeliverTx(sub)
+	customErr := app.chain.DeliverTx(sub)
 
 	if customErr != nil {
 		u2 := sub.SigInfo.URL
@@ -384,24 +409,12 @@ func (app *Accumulator) DeliverTx(req abci.RequestDeliverTx) (rdt abci.ResponseD
 		if e2 == nil {
 			u2 = u.String()
 		}
-		sentry.CaptureException(err)
+		sentry.CaptureException(customErr)
 		app.logger.Info("Deliver failed", "type", sub.TransactionType().Name(), "tx", txHash, "error", customErr)
 		ret.Code = uint32(customErr.Code)
 		//we don't care about failure as far as tendermint is concerned, so we should place the log in the pending
 		ret.Log = fmt.Sprintf("%s delivery of %s transaction failed: %v", u2, sub.TransactionType().Name(), customErr)
 		return ret
-	}
-
-	for _, syn := range r.SyntheticTxs {
-		ret.Events = append(ret.Events, abci.Event{
-			Type: "accSyn",
-			Attributes: []abci.EventAttribute{
-				{Key: "type", Value: types.TxType(syn.Type).String()},
-				{Key: "hash", Value: fmt.Sprintf("%X", syn.Hash)},
-				{Key: "url", Value: syn.Url},
-				{Key: "txRef", Value: fmt.Sprintf("%X", syn.TxRef)},
-			},
-		})
 	}
 
 	//now we need to store the data returned by the validator and feed into accumulator
@@ -449,8 +462,7 @@ func (app *Accumulator) Commit() (resp abci.ResponseCommit) {
 	resp.Data = mdRoot
 
 	if err != nil {
-		sentry.CaptureException(err)
-		app.logger.Error(err.Error(), "operation", "commit")
+		app.fatal(err)
 		return
 	}
 

@@ -117,12 +117,13 @@ func (p *Program) Start(s service.Service) error {
 	}
 
 	var exec *chain.Executor
+	clientProxy := node.NewLocalClient()
 	query := apiv1.NewQuery(p.relay)
 	switch cfg.Accumulate.Type {
 	case config.BlockValidator:
-		exec, err = chain.NewBlockValidatorExecutor(query, p.db, pv.Key.PrivKey.Bytes())
+		exec, err = chain.NewBlockValidatorExecutor(query, clientProxy, p.db, pv.Key.PrivKey.Bytes())
 	case config.Directory:
-		exec, err = chain.NewDirectoryExecutor(query, p.db, pv.Key.PrivKey.Bytes())
+		exec, err = chain.NewDirectoryExecutor(query, clientProxy, p.db, pv.Key.PrivKey.Bytes())
 	default:
 		return fmt.Errorf("%q is not a valid Accumulate subnet type", cfg.Accumulate.Type)
 	}
@@ -146,7 +147,7 @@ func (p *Program) Start(s service.Service) error {
 		fmt.Fprintf(os.Stderr, "Error: failed to initialize logger: %v", err)
 		os.Exit(1)
 	}
-	p.db.SetLogger(logger)
+	// p.db.SetLogger(logger)
 
 	app, err := abci.NewAccumulator(p.db, pv.Key.PubKey.Address(), exec, logger)
 	if err != nil {
@@ -182,6 +183,7 @@ func (p *Program) Start(s service.Service) error {
 	if err != nil {
 		return fmt.Errorf("failed to create local node client: %v", err)
 	}
+	clientProxy.Set(lclient)
 
 	// Configure JSON-RPC
 	var jrpcOpts api.JrpcOptions

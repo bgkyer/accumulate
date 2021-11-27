@@ -314,6 +314,11 @@ func (c *ABCIApplicationClient) ABCIQueryWithOptions(ctx context.Context, path s
 	return &ctypes.ResultABCIQuery{Response: r}, nil
 }
 
+func (c *ABCIApplicationClient) CheckTx(ctx context.Context, tx types.Tx) (*ctypes.ResultCheckTx, error) {
+	cr := c.App().CheckTx(abci.RequestCheckTx{Tx: tx})
+	return &ctypes.ResultCheckTx{ResponseCheckTx: cr}, nil
+}
+
 func (c *ABCIApplicationClient) BroadcastTxAsync(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
 	// Wait for nothing
 	c.SubmitTx(ctx, tx)

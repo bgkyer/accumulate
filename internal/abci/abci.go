@@ -30,6 +30,17 @@ type BeginBlockRequest struct {
 	Time     time.Time
 }
 
+type BeginBlockResponse struct {
+	SynthTxns []SynthTxnReference
+}
+
+type SynthTxnReference struct {
+	Type  uint64   `json:"type,omitempty" form:"type" query:"type" validate:"required"`
+	Hash  [32]byte `json:"hash,omitempty" form:"hash" query:"hash" validate:"required"`
+	Url   string   `json:"url,omitempty" form:"url" query:"url" validate:"required,acc-url"`
+	TxRef [32]byte `json:"txRef,omitempty" form:"txRef" query:"txRef" validate:"required"`
+}
+
 type EndBlockRequest struct{}
 
 type Chain interface {
@@ -37,9 +48,9 @@ type Chain interface {
 
 	InitChain(state []byte) error
 
-	BeginBlock(BeginBlockRequest)
+	BeginBlock(BeginBlockRequest) (BeginBlockResponse, error)
 	CheckTx(*transactions.GenTransaction) *protocol.Error
-	DeliverTx(*transactions.GenTransaction) (*protocol.TxResult, *protocol.Error)
+	DeliverTx(*transactions.GenTransaction) *protocol.Error
 	EndBlock(EndBlockRequest)
 	Commit() ([]byte, error)
 }

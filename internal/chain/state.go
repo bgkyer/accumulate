@@ -26,6 +26,7 @@ type StateManager struct {
 	storeCount  int
 	txHash      types.Bytes32
 	txType      types.TxType
+	synthSigs   []*state.SyntheticSignature
 
 	Sponsor        state.Chain
 	SponsorUrl     *url.URL
@@ -307,6 +308,10 @@ func (m *StateManager) commit() error {
 		}
 	}
 
+	for _, sig := range m.synthSigs {
+		m.dbTx.AddSynthTxnSig(sig)
+	}
+
 	return nil
 }
 
@@ -320,6 +325,8 @@ func unmarshalRecord(obj *state.Object) (state.Chain, error) {
 	var record state.Chain
 	switch header.Type {
 	// TODO DC, BVC, Token
+	case types.ChainTypeTokenIssuer:
+		record = new(protocol.TokenIssuer)
 	case types.ChainTypeIdentity:
 		record = new(state.AdiState)
 	case types.ChainTypeTokenAccount:
@@ -390,4 +397,29 @@ func AddDirectoryEntry(db interface {
 	db.WriteIndex(state.DirectoryIndex, idc, "Metadata", b)
 	db.WriteIndex(state.DirectoryIndex, idc, c, []byte(u.String()))
 	return nil
+}
+
+// LoadSynthTxn loads and unmarshals a saved synthetic transaction
+func (m *StateManager) LoadSynthTxn(txid [32]byte) (*state.PendingTransaction, error) {
+	obj, err := m.dbTx.DB().GetSynthTxn(txid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get txn %X: %v", txid, err)
+	}
+
+	state := new(state.PendingTransaction)
+	err = obj.As(state)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal txn %X: %v", txid, err)
+	}
+
+	return state, nil
+}
+
+func (m *StateManager) AddSynthTxnSig(publicKey []byte, sig *protocol.SyntheticSignature) {
+	m.synthSigs = append(m.synthSigs, &state.SyntheticSignature{
+		Txid:      sig.Txid,
+		Signature: sig.Signature,
+		PublicKey: publicKey,
+		Nonce:     sig.Nonce,
+	})
 }
